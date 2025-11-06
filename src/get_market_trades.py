@@ -10,6 +10,7 @@ from collections.abc import Mapping
 import random
 from aiohttp import ContentTypeError
 import json
+import re
 
 from get_all_takers import get_all_takers
 from utils import parquet_num_rows
@@ -20,6 +21,25 @@ API = "https://data-api.polymarket.com/trades"
 RPS = 13                    # 150 / 10s
 CAPACITY = 150              # burst cap
 MAX_CONCURRENCY = 200       # sockets/tasks; the bucket enforces the true rate
+MAX_RETRIES = 3             # maximum re-trying before error
+
+
+def clean_html_snippet(text: str, max_len: int = 200) -> str:
+    """Strip HTML tags and collapse whitespace for compact log display."""
+    text = re.sub(r"<[^>]+>", " ", text)          # remove tags
+    text = re.sub(r"\s+", " ", text).strip()      # normalize spaces
+    text = re.sub(r"(?is)<script.*?</script>", " ")
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # cut before Cloudflare's inline JS
+    split_pat = re.compile(r"\(function|\bfunction\s*\(|\bvar\s|\bwindow\.|\bdocument\.", re.I)
+    m = split_pat.search(text)
+    if m:
+        text = text[:m.start()].rstrip()
+
+    return text[:max_len]
+
 
 class TokenBucket:
     def __init__(self, rate_per_sec: float = RPS, capacity: int = CAPACITY):
@@ -42,15 +62,12 @@ class TokenBucket:
                 self.last = now
             self.tokens -= 1
 
-# requires: import random, contextlib, json
-# from aiohttp import ContentTypeError
-
 async def _get_json(session: aiohttp.ClientSession, bucket: TokenBucket, params: dict):
     backoff = 0.5
     last_status = None
     last_body = None
 
-    for attempt in range(7):
+    for attempt in range(MAX_RETRIES):
         await bucket.acquire()
         await asyncio.sleep(random.random() * 0.05)  # jitter
 
@@ -65,16 +82,22 @@ async def _get_json(session: aiohttp.ClientSession, bucket: TokenBucket, params:
                         text = await r.text()
                         raise RuntimeError(f"Bad JSON decode status={r.status} body[:200]={text[:200]!r}")
 
+                # retryable HTTPs
                 if r.status in (408, 429, 500, 502, 503, 504):
                     with contextlib.suppress(Exception):
-                        last_body = (await r.text())[:200]
+                        raw = await r.text()
+                        last_body = clean_html_snippet(raw)
+
                     ra = r.headers.get("Retry-After")
                     delay = max(0.5, float(ra)) if ra and ra.replace(".", "", 1).isdigit() \
                             else backoff + random.random() * 0.5
+
+                    
                     await asyncio.sleep(delay)
                     backoff = min(backoff * 2, 8.0)
                     continue
 
+                # non-retryable HTTP
                 body = await r.text()
                 raise RuntimeError(f"HTTP {r.status}: body[:200]={body[:200]!r}")
 
@@ -87,6 +110,7 @@ async def _get_json(session: aiohttp.ClientSession, bucket: TokenBucket, params:
     raise RuntimeError(
         f"GET failed after retries status={last_status} body[:200]={last_body!r} params={p}"
     )
+
 
 # paginate with page_size=25; continue only when exactly 25 rows are returned
 async def fetch_trades_for_user_market_async(session: aiohttp.ClientSession,
@@ -110,8 +134,9 @@ async def fetch_trades_for_user_market_async(session: aiohttp.ClientSession,
     return out
 
 async def get_trades_for_market_async(condition_id, clobs) -> List[dict]:
+
     takers = get_all_takers(clobs)
-    
+
     bucket = TokenBucket(RPS, CAPACITY)
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -124,7 +149,6 @@ async def get_trades_for_market_async(condition_id, clobs) -> List[dict]:
                 if trades:
                     results.extend(trades)
 
-        # pipeline with periodic progress prints
         tasks = []
         for i, a in enumerate(takers, 1):
             tasks.append(asyncio.create_task(worker(a)))
@@ -137,7 +161,6 @@ def get_trades_for_market(condition_id, clobs):
     return loop.run_until_complete(get_trades_for_market_async(condition_id, clobs))
 
 def get_trades_save_parquet(condition_id, clobs, file_path, skip_existing):
-
     file_rows = parquet_num_rows(file_path)
     need_rewrite = (file_rows <= 0)
     if skip_existing and not need_rewrite:
