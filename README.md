@@ -10,7 +10,7 @@ This repository provides a two-step workflow to download Polymarket market metad
 
 ```bash
 # 1) Download markets into ./markets
-python backfill_markets_jsonl.py \
+python pull_markets.py \
   --start 2024-10-01 \
   --end   2024-10-31 \
   --limit 500 \
@@ -31,7 +31,7 @@ python build_db.py \
 
 Writes one JSONL per day into `./markets`.
 
-**Script:** `backfill_markets_jsonl.py`  
+**Script:** `pull_markets.py`  
 **Args:**
 - `--start YYYY-MM-DD`
 - `--end YYYY-MM-DD`
@@ -43,7 +43,7 @@ Writes one JSONL per day into `./markets`.
 
 **Example:**
 ```bash
-python backfill_markets_jsonl.py \
+python pull_markets.py \
   --start 2024-09-01 --end 2024-11-01 \
   --limit 1000 --min_volume 0 --closed false \
   --outdir ./markets --timeout 20
