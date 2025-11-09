@@ -61,7 +61,7 @@ Result layout:
 
 Reads JSONL files from `./markets` and produces:
 - SQLite at `./data/polymarket.db`
-- Parquet datasets under `./data/parquet/...`
+- Parquet datasets under `./data/trades_by_event/...`
 
 **Script:** `build_db.py`  
 **Args:**

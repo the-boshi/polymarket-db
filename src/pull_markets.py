@@ -134,14 +134,18 @@ def main():
             print(f"[error] failed {day_str}: {e}")
             continue
 
-        out_path = out_base / f"{day_str}.jsonl"
+        if (len(items) > 0):
+            out_path = out_base / f"{day_str}.jsonl"
 
-        with out_path.open("w", encoding="utf-8") as f:
-            for obj in items:
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            with out_path.open("w", encoding="utf-8") as f:
+                for obj in items:
+                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-        total_rows += len(items)
-        print(f"[{day_str}] wrote {len(items)} markets → {out_path}")
+            total_rows += len(items)
+            print(f"[{day_str}] wrote {len(items)} markets → {out_path}")
+        else: 
+            print(f"[{day_str}] has 0 markets")
+        
 
     print(f"Done. Days processed: {total_days}. Total markets written: {total_rows}. Base dir: {out_base.resolve()}")
 
