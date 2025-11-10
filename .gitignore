@@ -12,4 +12,10 @@ __pycache__/
 .DS_Store
 
 # data
-data/
+data_old/
+old/
+raw_trades/
+
+*.log
+*.db*
+*.sqlite

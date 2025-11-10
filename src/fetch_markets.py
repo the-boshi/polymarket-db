@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+# fetch_markets.py
+
 import argparse
 import json
-import os
 import sys
 import time
 from collections import deque
@@ -12,7 +12,6 @@ from typing import List, Dict, Any
 import requests
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
-
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -33,7 +32,6 @@ def parse_args():
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds (default: 60)")
     return p.parse_args()
 
-
 # -------- rate limiting: ≤100 requests per 10 seconds --------
 _req_times = deque()
 
@@ -46,7 +44,6 @@ def rate_limit(max_requests: int = 100, per_seconds: float = 10.0):
         if sleep_for > 0:
             time.sleep(sleep_for)
     _req_times.append(time.time())
-
 
 def fetch_one_page(day_str: str, day_plus1_str: str, limit: int, offset: int,
                    min_volume: str, closed: str, timeout: int) -> List[Dict[str, Any]]:
@@ -80,7 +77,6 @@ def fetch_one_page(day_str: str, day_plus1_str: str, limit: int, offset: int,
             else:
                 raise
 
-
 def fetch_all_for_day(day: datetime.date, limit: int, min_volume: str, closed: str, timeout: int) -> List[Dict[str, Any]]:
     day_str = day.strftime("%Y-%m-%d")
     day_plus1_str = (day + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -102,13 +98,11 @@ def fetch_all_for_day(day: datetime.date, limit: int, min_volume: str, closed: s
 
     return all_items
 
-
 def daterange(start_date: datetime.date, end_exclusive: datetime.date):
     cur = start_date
     while cur < end_exclusive:
         yield cur
         cur = cur + timedelta(days=1)
-
 
 def main():
     args = parse_args()
@@ -148,7 +142,6 @@ def main():
         
 
     print(f"Done. Days processed: {total_days}. Total markets written: {total_rows}. Base dir: {out_base.resolve()}")
-
 
 if __name__ == "__main__":
     main()
