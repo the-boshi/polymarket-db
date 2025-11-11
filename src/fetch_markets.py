@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument("--limit", type=int, default=500, help="Page size per request (default: 500)")
     p.add_argument("--min-volume", dest="min_volume", default="0",
                    help="volume_num_min filter (string or number, default: 0)")
-    p.add_argument("--closed", default="true",
+    p.add_argument("--closed", default="false",
                    help='Pass "true" or "false" (string) to the "closed" param (default: "true")')
     p.add_argument("--outdir", default="markets", help='Base output folder (default: "markets")')
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds (default: 60)")

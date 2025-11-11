@@ -13,13 +13,17 @@ import glob
 import time
 import logging
 import sqlite3
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Optional
 import argparse
 from datetime import datetime, date, timedelta
 import calendar
+from itertools import islice
+import random
 
 from utils import infer_winner, ensure_list, _market_start_date
-from fetch_users_utils_par import get_all_takers
+from fetch_users_utils import get_all_takers
 
 # -------------------------
 # Paths and constants
@@ -32,7 +36,7 @@ LOG_PATH    = os.path.join(LOG_DIR, f"users-{time.strftime('%Y%m%d-%H%M%S')}.log
 
 LOG_LEVEL = os.getenv("PMDB_LOG_LEVEL", "INFO").upper()
 
-NUM_WORKERS = 5
+NUM_WORKERS = 20
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -244,83 +248,52 @@ def list_jsonl_files_by_date(
 # -------------------------
 # Per-market processing
 # -------------------------
-def process_market(cur: sqlite3.Cursor, market: Dict):
+
+def _extract_asset_ids(market: dict) -> list[str]:
+    return [str(x) for x in ensure_list(market.get("clobTokenIds"))]
+
+def _fetch_users_for_market(market: dict) -> list[str]:
+    asset_ids = _extract_asset_ids(market)
+    try:
+        return sorted(set(get_all_takers(asset_ids)))
+    except Exception as e:
+        logger.warning(f"Goldsky failure for market {market.get('conditionId')}: {e}")
+        return []
+
+def _write_market_jsonl(market: dict) -> str:
+    """Create one-line JSONL file: {'market': <market_dict>, 'users': [..]}."""
+    data = {"market": market, "users": _fetch_users_for_market(market)}
+    fd, path = tempfile.mkstemp(prefix="market_", suffix=".jsonl")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    return path
+
+def upsert_market_bundle(cur: sqlite3.Cursor, market: dict, users: list[str]) -> None:
     condition_id = market.get("conditionId")
     if not condition_id:
         return
 
-    # events
     evs = market.get("events") or []
-    if evs:
-        for ev in evs:
-            if ev.get("id"):
-                upsert_event(cur, ev)
-    event_id = market.get("events")[0].get("id")
+    for ev in evs:
+        if ev.get("id"):
+            upsert_event(cur, ev)
+    event_id = (market.get("events") or [{}])[0].get("id")
 
-    outcomes = [str(x) for x in ensure_list(market.get("outcomes"))]       # e.g. ["Yes","No"]
-    asset_ids    = [str(x) for x in ensure_list(market.get("clobTokenIds"))]   # aligned asset ids
-    prices   = ensure_list(market.get("outcomePrices"))                     # e.g. ["1","0"]
+    outcomes   = [str(x) for x in ensure_list(market.get("outcomes"))]
+    asset_ids  = [str(x) for x in ensure_list(market.get("clobTokenIds"))]
+    prices     = ensure_list(market.get("outcomePrices"))
 
-    slug = market.get("slug")
-    start_date = _market_start_date(market)
-
-    # infer winner
     winner_name, winner_id = infer_winner(outcomes, prices, asset_ids)
     outcome = (winner_name or "").strip().lower()
 
     upsert_market(cur, market, outcome, event_id)
 
-    # upsert assets with names aligned to first N outcomes
     for idx, asset_id in enumerate(asset_ids):
         name = outcomes[idx] if idx < len(outcomes) else None
         upsert_asset(cur, asset_id, condition_id, name, idx)
 
-    logger.info(f"[{start_date}] {slug}")
-
-    # users via subgraph
-    try:
-        takers = get_all_takers(asset_ids)
-    except Exception as e:
-        logger.warning(f"Goldsky failure for market {condition_id}: {e}")
-        takers = []
-    for uid in takers:
+    for uid in users:
         upsert_user_and_link(cur, uid, condition_id)
-
-    logger.info(f"linked_users={len(takers)}")
-
-import concurrent.futures, sqlite3
-from itertools import islice
-
-import sqlite3, time, random
-
-def _process_market_parallel(m):
-    for attempt in range(10):
-        try:
-            conn = sqlite3.connect(
-                DB_PATH,
-                timeout=30,
-                check_same_thread=False,
-                isolation_level=None,  # autocommit; we control txn
-            )
-            try:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-                conn.execute("PRAGMA busy_timeout=5000;")
-
-                cur = conn.cursor()
-                cur.execute("BEGIN;")
-                process_market(cur, m)
-                conn.commit()
-                return
-            finally:
-                conn.close()
-        except sqlite3.OperationalError as e:
-            msg = str(e).lower()
-            if "database is locked" in msg or "busy" in msg:
-                #print("database locked")
-                time.sleep(min(0.05 * (2 ** attempt), 2.0) + random.random() * 0.05)
-                continue
-            raise
 
 def _batched(it, n):
     it = iter(it)
@@ -361,14 +334,34 @@ def main():
         users_before = count_users(cur)
         logger.info(f"Begin file transaction: {fp}")
         for batch in _batched(iter_market_jsonl(fp), 10):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-                futs = [ex.submit(_process_market_parallel, m) for m in batch]
-                for fut in concurrent.futures.as_completed(futs):
+            # Phase 1: parallel fetch → per-market JSONL paths
+            paths = []
+            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+                futs = [ex.submit(_write_market_jsonl, m) for m in batch]
+                for fut in as_completed(futs):
                     try:
-                        fut.result()
-                        total_markets += 1
+                        paths.append(fut.result())
                     except Exception as e:
-                        logger.warning(f"Skip market due to error: {e}")
+                        logger.warning(f"Fetch skipped due to error: {e}")
+
+            # Phase 2: single-writer upsert
+            cur.execute("BEGIN;")
+            try:
+                for p in paths:
+                    with open(p, "r") as f:
+                        rec = json.loads(f.readline())
+                    upsert_market_bundle(cur, rec["market"], rec["users"])
+                    total_markets += 1
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Batch upsert rolled back: {e}")
+            finally:
+                for p in paths:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
         users_after = count_users(cur)
         total_users = users_after

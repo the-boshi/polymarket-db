@@ -1,506 +1,822 @@
+#!/usr/bin/env python3
 # fetch_trades.py
-# Fetch all Polymarket activity trades per user and upsert into SQLite.
-# Stage 1: async fetch → raw JSONL per user (rate-limited, concurrent).
-# Stage 2: sync upsert → SQLite (creates/updates schema as needed).
-#
-# Env knobs:
-#   PMDB_LOG_LEVEL=DEBUG|INFO|WARNING
-#   PMDB_CONCURRENCY=8          # concurrent users
-#   PMDB_RATE_MAX=100           # max requests per window
-#   PMDB_RATE_WINDOW=10         # window seconds
-#   PMDB_RAW_DIR=raw_trades     # folder under BASE_DIR
-#   PMDB_USERS_LIMIT=0          # 0 means all users; else first N
-#
-# Usage:
-#   python fetch_trades.py
-#   python fetch_trades.py --only 0xabc,0xdef     # subset of users
-#   python fetch_trades.py --resume               # skip users with existing raw file
+# Async fetch Polymarket user trades, save per-user JSONL, and ingest into SQLite via a single-writer queue.
+# Requirements fulfilled per spec: global sliding-window rate limit, retries with backoff and page-size fallback,
+# offset-first fetch + time-window fallback, per-user JSONL, single-writer queue, schema ensure, placeholders.
 
-import os, json, time, asyncio, logging, hashlib, sqlite3
+import os
+import sys
+import json
+import time
+import math
 import argparse
-from typing import Dict, List, Optional, Tuple, Set
-from collections import deque
-from datetime import datetime
+import asyncio
+import logging
+import sqlite3
+import random
+import hashlib
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, getcontext
+from pathlib import Path
+from datetime import datetime, timezone
+from collections import deque, defaultdict
+from typing import Any, Dict, List, Tuple, Optional
 
 import aiohttp
 
-# -------------------------
-# Paths and constants
-# -------------------------
-BASE_DIR   = os.path.expanduser("~/Documents/Projects/polymarket-db")
-DB_PATH    = os.path.join(BASE_DIR, "polymarket_copy.db")
-RAW_DIR    = os.path.join(BASE_DIR, os.getenv("PMDB_RAW_DIR", "raw_trades"))
-LOG_DIR    = os.path.join(BASE_DIR, "logs")
-LOG_PATH   = os.path.join(LOG_DIR, f"trades-{time.strftime('%Y%m%d-%H%M%S')}.log")
-
-LOG_LEVEL  = os.getenv("PMDB_LOG_LEVEL", "INFO").upper()
-CONCURRENCY = int(os.getenv("PMDB_CONCURRENCY", os.getenv("PMDB_CONCURRENCY", os.getenv("PMDB_CONCURRENCY", "8"))))
-RATE_MAX   = int(os.getenv("PMDB_RATE_MAX", "100"))
-RATE_WIN   = float(os.getenv("PMDB_RATE_WINDOW", "10"))
-USERS_LIMIT = int(os.getenv("PMDB_USERS_LIMIT", "0"))
-
 API_URL = "https://data-api.polymarket.com/activity"
-HEADERS = {"User-Agent": "polymarket-db/1.0", "Accept": "application/json"}
 
-# Paging and fallback thresholds
-PAGE_SIZE = 500
-OFFSET_STEPS = (0, 500, 1000)             # offset+limit <= 1500
-NEAR_CAP_THRESHOLD = 1400                 # switch to time-window if >= this
-INIT_WINDOW_DAYS = 30                     # initial time window
-MIN_WINDOW_DAYS  = 1
-EMPTY_WINDOWS_TO_STOP = 2                 # stop after this many empty windows after seeing data
+# ---------- Utilities ----------
 
-# -------------------------
-# Logger
-# -------------------------
-def get_logger() -> logging.Logger:
-    os.makedirs(LOG_DIR, exist_ok=True)
-    logger = logging.getLogger("polymarket_trades")
-    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    logger.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    fh.setLevel(logger.level); fh.setFormatter(fmt); logger.addHandler(fh)
-    sh = logging.StreamHandler()
-    sh.setLevel(logger.level); sh.setFormatter(fmt); logger.addHandler(sh)
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v if v and v.strip() else default
+
+def now_utc_ts() -> int:
+    return int(time.time())
+
+def ts_to_batch(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+def utc_iso(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+def sha1_hex(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+def decimal_fmt(x: Any) -> str:
+    # Format as fixed 10 decimals, no scientific, round down.
+    getcontext().prec = 40
+    try:
+        d = Decimal(str(x))
+    except InvalidOperation:
+        d = Decimal(0)
+    q = d.quantize(Decimal("0.0000000001"), rounding=ROUND_DOWN)
+    # normalize to exactly 10 decimals
+    s = f"{q:.10f}"
+    return s
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+
+def pick_first_nonempty(*vals) -> Optional[str]:
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def get_nested(d: Dict[str, Any], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+def _shard_parts(wallet: str) -> tuple[str, str]:
+    w = wallet.lower().lstrip("0x")
+    if len(w) < 4:
+        w = w.ljust(4, "0")
+    return w[:2], w[2:4]
+
+
+# ---------- Logger ----------
+
+def setup_logger(base_dir: Path, batch_tag: str, level_name: str) -> logging.Logger:
+    logs_dir = base_dir / "logs"
+    ensure_dir(logs_dir)
+    log_path = logs_dir / f"trades-{batch_tag}.log"
+
+    logger = logging.getLogger("pmdb")
+    logger.setLevel(getattr(logging, level_name.upper(), logging.INFO))
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    ch = logging.StreamHandler(sys.stdout)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    logger.propagate = False
     return logger
 
-logger = get_logger()
+# ---------- Rate Limiter (sliding window) ----------
 
-# -------------------------
-# Rate limiter: sliding window (N per T seconds) across all tasks
-# -------------------------
 class SlidingWindowLimiter:
-    def __init__(self, max_calls: int, per_seconds: float):
+    def __init__(self, max_calls: int, window_sec: float, logger: logging.Logger):
         self.max_calls = max_calls
-        self.per = per_seconds
-        self._dq = deque()
+        self.window = window_sec
+        self.logger = logger
+        self._dq = deque()  # monotonic times
         self._lock = asyncio.Lock()
 
     async def acquire(self):
-        async with self._lock:
-            now = time.monotonic()
-            while self._dq and (now - self._dq[0]) > self.per:
-                self._dq.popleft()
-            if len(self._dq) >= self.max_calls:
-                sleep_for = self.per - (now - self._dq[0]) + 0.01
-                await asyncio.sleep(sleep_for)
-                # re-evaluate after sleep
-                return await self.acquire()
-            self._dq.append(time.monotonic())
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                # drop stale
+                while self._dq and (now - self._dq[0]) > self.window:
+                    self._dq.popleft()
+                if len(self._dq) < self.max_calls:
+                    self._dq.append(now)
+                    return
+                # need to wait
+                wait = self.window - (now - self._dq[0]) + random.uniform(0.01, 0.05)
+                wait = max(0.01, min(wait, self.window))
+                self.logger.debug(f"[rate] stall {wait:.3f}s; q={len(self._dq)}/{self.max_calls}")
+            await asyncio.sleep(wait)
 
-# -------------------------
-# SQLite schema and helpers
-# -------------------------
-TRADES_SCHEMA = """
-CREATE TABLE IF NOT EXISTS trades (
-  trade_uid TEXT PRIMARY KEY,
-  proxy_wallet TEXT NOT NULL,
-  timestamp INTEGER NOT NULL,
-  condition_id TEXT,
-  size REAL,
-  usdc_size REAL,
-  transaction_hash TEXT,
-  price REAL,
-  asset TEXT,
-  side TEXT,
-  outcome_index INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_trades_user_time ON trades(proxy_wallet, timestamp);
-CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(condition_id);
-"""
+# ---------- HTTP GET with retries ----------
 
-def ensure_schema(conn: sqlite3.Connection):
-    conn.executescript(TRADES_SCHEMA)
-    # users extra cols if missing
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(users)")
-    cols = {r[1] for r in cur.fetchall()}
-    if "name" not in cols:
-        conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
-    if "pseudonym" not in cols:
-        conn.execute("ALTER TABLE users ADD COLUMN pseudonym TEXT")
-    conn.commit()
+RETRY_STATUSES = {408, 409, 420, 429, 500, 502, 503, 504}
 
-def update_user_metadata(conn: sqlite3.Connection, user: str, name: Optional[str], pseudonym: Optional[str]):
-    if not name and not pseudonym:
-        return
-    # only fill if NULL or empty
-    cur = conn.cursor()
-    cur.execute("SELECT name, pseudonym FROM users WHERE id=?", (user,))
-    row = cur.fetchone()
-    if row is None:
-        return
-    cur_name, cur_pseudo = row
-    name_to_set = name if name and not cur_name else None
-    pseudo_to_set = pseudonym if pseudonym and not cur_pseudo else None
-    if name_to_set or pseudo_to_set:
-        conn.execute(
-            "UPDATE users SET name=COALESCE(?, name), pseudonym=COALESCE(?, pseudonym) WHERE id=?",
-            (name_to_set, pseudo_to_set, user),
-        )
+async def api_get_json(
+    session: aiohttp.ClientSession,
+    limiter: SlidingWindowLimiter,
+    params: Dict[str, Any],
+    logger: logging.Logger,
+    max_retries: int = 7,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Returns a list of activity rows or None on non-retriable 4xx.
+    On 503 after a retry, page size fallback: 500→250→100→50.
+    """
+    # apply page-size fallback sequence if 'limit' present
+    limit_seq = [params.get("limit", 500)]
+    limit_seq = [int(limit_seq[0]) if limit_seq[0] is not None else 500]
+    # normalize allowed sizes
+    allowed = [500, 250, 100, 50]
+    if limit_seq[0] not in allowed:
+        limit_seq = [500]
+    for s in allowed:
+        if s != limit_seq[0]:
+            limit_seq.append(s)
 
-def trade_uid(t: Dict) -> str:
-    # Stable digest across retries and overlapping windows
-    key = "|".join([
-        str(t.get("proxyWallet","")),
-        str(t.get("timestamp","")),
-        str(t.get("conditionId","")),
-        str(t.get("asset","")),
-        str(t.get("side","")),
-        # normalize floats to fixed repr
-        f'{float(t.get("price", 0.0)):.10f}',
-        f'{float(t.get("size", 0.0)):.10f}',
-        str(t.get("transactionHash","")),
-    ])
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()
-
-def upsert_trades(conn: sqlite3.Connection, user: str, rows: List[Dict]) -> int:
-    if not rows:
-        return 0
-    cur = conn.cursor()
-    n = 0
-    for r in rows:
-        # NEW: ensure market exists and warn once per missing market
-        ensure_market_exists(conn, r, user)
-
-        uid = trade_uid(r)
-        cur.execute(
-            """INSERT OR IGNORE INTO trades(
-                 trade_uid, proxy_wallet, timestamp, condition_id, size, usdc_size,
-                 transaction_hash, price, asset, side, outcome_index
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                uid,
-                r.get("proxyWallet"),
-                int(r.get("timestamp")),
-                r.get("conditionId"),
-                float(r.get("size") or 0.0),
-                float(r.get("usdcSize") or 0.0),
-                r.get("transactionHash"),
-                float(r.get("price") or 0.0),
-                r.get("asset"),
-                r.get("side"),
-                int(r.get("outcomeIndex") or 0),
-            ),
-        )
-        n += cur.rowcount
-    return n
-
-# -------------------------
-# Fetching logic
-# -------------------------
-RETRY_STATUS = {408, 409, 420, 429, 500, 502, 503, 504}
-
-async def _get(session: aiohttp.ClientSession, limiter: SlidingWindowLimiter, params: Dict, max_retries: int = 7) -> Optional[List[Dict]]:
     backoff = 0.5
-    last_status = None
-    last_body = None
-    for attempt in range(max_retries):
+    attempt = 0
+    lim_idx = 0
+
+    while attempt <= max_retries:
+        attempt += 1
         await limiter.acquire()
         try:
-            async with session.get(API_URL, params=params, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                last_status = resp.status
-                if resp.status in RETRY_STATUS:
-                    last_body = (await resp.text())[:200]
-                    ra = resp.headers.get("Retry-After")
+            async with session.get(API_URL, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                status = resp.status
+                text = await resp.text()
+                if 200 <= status < 300:
                     try:
-                        delay = float(ra) if ra else backoff
-                    except ValueError:
-                        delay = backoff
-                    logger.debug(f"[get] {resp.status} retry in {delay:.2f}s params={params}")
-                    await asyncio.sleep(delay)
-                    backoff = min(backoff * 1.8, 8.0)
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        logger.warning(f"[http] JSON parse error len={len(text)}; params={params}")
+                        data = None
+                    # The endpoint returns a list; if dict, try common keys.
+                    if isinstance(data, list):
+                        return data
+                    if isinstance(data, dict):
+                        for key in ("data", "items", "result", "activity"):
+                            if isinstance(data.get(key), list):
+                                return data[key]
+                        # fallback: if dict contains 'rows' as list
+                        if isinstance(data.get("rows"), list):
+                            return data["rows"]
+                        return []
+                    return []
+                # Non-2xx
+                if status in RETRY_STATUSES:
+                    # 503 fallback after first retry
+                    if status == 503 and attempt >= 2 and "limit" in params:
+                        if lim_idx + 1 < len(limit_seq):
+                            lim_idx += 1
+                            params = dict(params)
+                            params["limit"] = limit_seq[lim_idx]
+                            logger.debug(f"[http] 503 fallback limit={params['limit']} params={params}")
+                    jitter = random.uniform(0.4, 0.9)
+                    sleep_s = backoff * jitter
+                    backoff = min(backoff * 2.0, 8.0)
+                    logger.debug(f"[http] retry {attempt}/{max_retries} status={status} sleep={sleep_s:.2f} params={params} body[:120]={text[:120]!r}")
+                    await asyncio.sleep(sleep_s)
                     continue
-                if resp.status >= 400:
-                    last_body = (await resp.text())[:200]
-                    logger.warning(f"[get] non-retryable HTTP {resp.status} body={last_body!r} params={params}")
+                else:
+                    # Non-retriable 4xx: skip
+                    logger.warning(f"[http] non-retriable status={status} params={params} body[:200]={text[:200]!r}")
                     return None
-                data = await resp.json()
-                if isinstance(data, list):
-                    return data
-                # Some deployments wrap in object; normalize
-                if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                    return data["data"]
-                return data if isinstance(data, list) else []
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
-            logger.debug(f"[get] network error {e} backoff={backoff:.2f}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.8, 8.0)
-    logger.warning(f"[get] failed after retries status={last_status} body={last_body!r} params={params}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            jitter = random.uniform(0.4, 0.9)
+            sleep_s = backoff * jitter
+            backoff = min(backoff * 2.0, 8.0)
+            logger.debug(f"[http] exception {type(e).__name__} retry {attempt}/{max_retries} sleep={sleep_s:.2f} params={params}")
+            await asyncio.sleep(sleep_s)
+            continue
+
+    logger.warning(f"[http] final failure after retries params={params}")
     return None
 
-async def fetch_offset_span(session: aiohttp.ClientSession, limiter: SlidingWindowLimiter, user: str) -> List[Dict]:
-    rows: List[Dict] = []
-    for off in OFFSET_STEPS:
-        params = {
-            "limit": str(PAGE_SIZE),
-            "offset": str(off),
-            "sortBy": "TIMESTAMP",
-            "sortDirection": "DESC",
-            "user": user,
-        }
-        page = await _get(session, limiter, params)
-        if not page:
-            break
-        rows.extend(page)
-        logger.debug(f"[offset] user={user} off={off} got={len(page)} acc={len(rows)}")
-        if len(page) < PAGE_SIZE:
-            break
-    return rows
+# ---------- Trade key + field extraction ----------
 
-async def fetch_window_pages(session: aiohttp.ClientSession, limiter: SlidingWindowLimiter, user: str, start_ts: int, end_ts: int) -> Tuple[List[Dict], bool]:
-    """Return rows, hit_near_cap"""
-    rows: List[Dict] = []
-    for off in OFFSET_STEPS:
-        params = {
-            "limit": str(PAGE_SIZE),
-            "offset": str(off),
-            "sortBy": "TIMESTAMP",
-            "sortDirection": "DESC",
-            "user": user,
-            "start": str(start_ts),
-            "end": str(end_ts),
-        }
-        page = await _get(session, limiter, params)
-        if not page:
-            break
-        rows.extend(page)
-        logger.debug(f"[window] user={user} {start_ts}->{end_ts} off={off} got={len(page)} acc={len(rows)}")
-        if len(page) < PAGE_SIZE:
-            break
-    return rows, (len(rows) >= NEAR_CAP_THRESHOLD)
+def extract_ts(row: Dict[str, Any]) -> Optional[int]:
+    for k in ("timestamp", "time", "createdAt"):
+        v = row.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    # try nested
+    v = get_nested(row, "payload", "timestamp")
+    if isinstance(v, int):
+        return v
+    return None
 
-def _dedup_rows(rows: List[Dict]) -> List[Dict]:
-    seen: Set[str] = set()
-    out: List[Dict] = []
+def extract_field(row: Dict[str, Any], keys: List[str], default=None):
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            return row[k]
+    # nested common
+    if "payload" in row and isinstance(row["payload"], dict):
+        for k in keys:
+            if k in row["payload"] and row["payload"][k] not in (None, ""):
+                return row["payload"][k]
+    return default
+
+def compute_trade_uid(row: Dict[str, Any]) -> str:
+    proxy = str(extract_field(row, ["proxyWallet", "wallet", "user"]))
+    ts = str(extract_ts(row) or "")
+    cond = str(extract_field(row, ["conditionId", "condition_id", "market"]))
+    asset = str(extract_field(row, ["asset", "clobTokenId", "tokenId"]))
+    side = str(extract_field(row, ["side"]))
+    price = decimal_fmt(extract_field(row, ["price"]))
+    size = decimal_fmt(extract_field(row, ["size", "amount"]))
+    txh = str(extract_field(row, ["transactionHash", "txHash", "tx"]))
+    return sha1_hex("|".join([proxy, ts, cond, asset, side, price, size, txh]))
+
+def row_to_trade_tuple(row: Dict[str, Any]) -> Tuple:
+    proxy_wallet = str(extract_field(row, ["proxyWallet", "wallet", "user"]) or "")
+    timestamp = int(extract_ts(row) or 0)
+    condition_id = str(extract_field(row, ["conditionId", "condition_id", "market"]) or "")
+    size = float(extract_field(row, ["size", "amount"]) or 0.0)
+    usdc_size = float(extract_field(row, ["usdcSize", "quote"]) or 0.0)
+    transaction_hash = str(extract_field(row, ["transactionHash", "txHash", "tx"]) or "")
+    price = float(extract_field(row, ["price"]) or 0.0)
+    asset = str(extract_field(row, ["asset", "clobTokenId", "tokenId"]) or "")
+    side = str(extract_field(row, ["side"]) or "")
+    outcome_index = extract_field(row, ["outcomeIndex", "outcome_index"])
+    try:
+        outcome_index = int(outcome_index) if outcome_index is not None else None
+    except Exception:
+        outcome_index = None
+    trade_uid = compute_trade_uid(row)
+    return (
+        trade_uid, proxy_wallet, timestamp, condition_id, size, usdc_size,
+        transaction_hash, price, asset, side, outcome_index
+    )
+
+def extract_market_meta_from_row(row: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    cond = str(extract_field(row, ["conditionId", "condition_id", "market"]) or "")
+    slug = extract_field(row, ["slug"])
+    desc = pick_first_nonempty(extract_field(row, ["title"]), extract_field(row, ["name"]))
+    return cond, slug, desc
+
+def extract_user_meta_from_rows(rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    name = None
+    pseudonym = None
     for r in rows:
-        uid = trade_uid(r)
+        # try top-level or nested 'user'
+        name = name or pick_first_nonempty(
+            str(extract_field(r, ["name"]) or ""),
+            str(get_nested(r, "user", "name") or ""),
+            str(get_nested(r, "user", "username") or ""),
+        )
+        pseudonym = pseudonym or pick_first_nonempty(
+            str(extract_field(r, ["pseudonym"]) or ""),
+            str(get_nested(r, "user", "pseudonym") or "")
+        )
+        if name and pseudonym:
+            break
+    return name, pseudonym
+
+# ---------- DB Schema + operations ----------
+
+def db_connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)  # autocommit
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+def ensure_tables(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    # trades
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades(
+      trade_uid TEXT PRIMARY KEY,
+      proxy_wallet TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      condition_id TEXT,
+      size REAL, usdc_size REAL,
+      transaction_hash TEXT, price REAL,
+      asset TEXT, side TEXT, outcome_index INTEGER
+    );""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_time ON trades(proxy_wallet, timestamp);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(condition_id);")
+    # markets (minimal)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS markets(
+      condition_id TEXT PRIMARY KEY,
+      slug TEXT,
+      start_date TEXT,
+      description TEXT
+    );""")
+    # users (minimal if absent)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      pseudonym TEXT
+    );""")
+    # Add columns if missing
+    def col_exists(table: str, col: str) -> bool:
+        cc = conn.execute(f"PRAGMA table_info({table});").fetchall()
+        return any(c[1] == col for c in cc)
+    if not col_exists("users", "name"):
+        cur.execute("ALTER TABLE users ADD COLUMN name TEXT;")
+    if not col_exists("users", "pseudonym"):
+        cur.execute("ALTER TABLE users ADD COLUMN pseudonym TEXT;")
+    cur.close()
+
+def upsert_trades(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> Tuple[int, set]:
+    if not rows:
+        return 0, set()
+    cur = conn.cursor()
+    conn.execute("BEGIN;")
+    inserted = 0
+    markets_seen: set = set()
+    for r in rows:
+        tpl = row_to_trade_tuple(r)
+        markets_seen.add(tpl[3])  # condition_id
+        try:
+            cur.execute("""
+                INSERT OR IGNORE INTO trades(
+                    trade_uid, proxy_wallet, timestamp, condition_id, size, usdc_size,
+                    transaction_hash, price, asset, side, outcome_index
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?);""", tpl)
+            if cur.rowcount > 0:
+                inserted += 1
+        except Exception:
+            # if schema mismatch happens, rollback that row and continue
+            pass
+    conn.execute("COMMIT;")
+    cur.close()
+    return inserted, markets_seen
+
+def ensure_market_placeholders(conn: sqlite3.Connection, wallet: str, cond_to_meta: Dict[str, Tuple[Optional[str], Optional[str]]], logger: logging.Logger) -> int:
+    if not cond_to_meta:
+        return 0
+    cur = conn.cursor()
+    new_count = 0
+    for cond, (slug, desc, oldest_ts) in cond_to_meta.items():
+        if not cond:
+            continue
+        row = cur.execute("SELECT 1 FROM markets WHERE condition_id=?;", (cond,)).fetchone()
+        if row:
+            continue
+        start_date_iso = utc_iso(oldest_ts) if oldest_ts else None
+        cur.execute(
+            "INSERT OR IGNORE INTO markets(condition_id, slug, start_date, description) VALUES (?,?,?,?);",
+            (cond, slug, start_date_iso, desc),
+        )
+        if cur.rowcount > 0:
+            new_count += 1
+            logger.warning(f"[new-market] user={wallet} market={cond} upserted placeholder")
+    cur.close()
+    return new_count
+
+def update_user_metadata(conn: sqlite3.Connection, wallet: str, name: Optional[str], pseudonym: Optional[str]) -> None:
+    if not wallet:
+        return
+    # ensure user exists
+    conn.execute("INSERT OR IGNORE INTO users(id) VALUES (?);", (wallet,))
+    # update non-empty if DB empty
+    row = conn.execute("SELECT name, pseudonym FROM users WHERE id=?;", (wallet,)).fetchone()
+    cur_name, cur_pseudo = row if row else (None, None)
+    set_name = (name and not (cur_name and str(cur_name).strip()))
+    set_pseudo = (pseudonym and not (cur_pseudo and str(cur_pseudo).strip()))
+    if set_name or set_pseudo:
+        conn.execute(
+            "UPDATE users SET name=COALESCE(?,name), pseudonym=COALESCE(?,pseudonym) WHERE id=?;",
+            (name if set_name else None, pseudonym if set_pseudo else None, wallet)
+        )
+
+def get_all_user_ids(conn: sqlite3.Connection) -> List[str]:
+    try:
+        rows = conn.execute("SELECT id FROM users;").fetchall()
+        return [r[0] for r in rows if r and r[0]]
+    except Exception:
+        return []
+
+# ---------- Fetch routines ----------
+
+async def fetch_edge_ts(session, limiter, logger, user: str, asc: bool) -> Optional[int]:
+    params = {
+        "user": user,
+        "limit": 1,
+        "sortBy": "TIMESTAMP",
+        "sortDirection": "ASC" if asc else "DESC",
+    }
+    data = await api_get_json(session, limiter, params, logger)
+    if not data:
+        return None
+    return extract_ts(data[0])
+
+async def fetch_page(session, limiter, logger, user: str, limit: int, offset: int, start: Optional[int], end: Optional[int]) -> List[Dict[str, Any]]:
+    params = {
+        "user": user,
+        "limit": int(limit),
+        "offset": int(offset),
+        "sortBy": "TIMESTAMP",
+        "sortDirection": "DESC",
+    }
+    if start is not None:
+        params["start"] = int(start)
+    if end is not None:
+        params["end"] = int(end)
+    data = await api_get_json(session, limiter, params, logger)
+    if data is None:
+        return []
+    logger.debug(f"[fetch] user={user} limit={limit} offset={offset} start={start} end={end} rows={len(data)}")
+    return data
+
+async def fetch_offsets_pass(session, limiter, logger, user: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    tasks = []
+    # serialize offsets to keep rate limiter simple
+    for off in (0, 500, 1000):
+        data = await fetch_page(session, limiter, logger, user, 500, off, None, None)
+        if not data:
+            continue
+        out.extend(data)
+        # if a page < 500, likely no further data for higher offsets
+        if len(data) < 500 and off < 1000:
+            # still try next offset? The spec says offsets 0/500/1000 always. We stop early to reduce load.
+            break
+    return out
+
+async def fetch_window_backward(session, limiter, logger, user: str, start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for off in (0, 500, 1000):
+        data = await fetch_page(session, limiter, logger, user, 500, off, start_ts, end_ts)
+        if not data:
+            continue
+        out.extend(data)
+    return out
+
+async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict[str, Any]], int, bool]:
+    """
+    Returns (rows, windows_used, used_fallback)
+    """
+    rows: List[Dict[str, Any]] = await fetch_offsets_pass(session, limiter, logger, user)
+    used_fallback = False
+    windows_used = 0
+
+    # Deduplicate early by trade_uid to avoid growing memory with repeats.
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in rows:
+        uid = compute_trade_uid(r)
         if uid in seen:
             continue
         seen.add(uid)
-        out.append(r)
-    return out
+        deduped.append(r)
+    rows = deduped
 
-async def fetch_user_all(session: aiohttp.ClientSession, limiter: SlidingWindowLimiter, user: str) -> Tuple[List[Dict], bool, Optional[str], Optional[str]]:
-    """
-    Returns: (rows, used_windows, name, pseudonym)
-    """
-    # First pass: offset span up to 1500
-    rows = await fetch_offset_span(session, limiter, user)
-    used_windows = False
+    full_pages = 3 if len(rows) >= 1500 else sum(1 for k in (0, 500, 1000))
+    need_fallback = (len(rows) >= 1400)  # heuristic near-cap
+    if not rows:
+        return rows, windows_used, used_fallback
 
-    # Name/pseudonym from first page if present
-    name = None
-    pseudo = None
-    for r in rows[:50]:
-        name = name or r.get("name")
-        pseudo = pseudo or r.get("pseudonym")
-        if name and pseudo:
-            break
+    oldest_ts = min(extract_ts(r) or now_utc_ts() for r in rows)
+    current_end = (oldest_ts - 1) if oldest_ts else int(time.time())
+    window_days = 30
+    tw_curr = 1.0  # days; start small and ramp up
+    min_days = 1/24
+    cap = 1495
+    oldest_edge: Optional[int] = None
 
-    if len(rows) >= NEAR_CAP_THRESHOLD:
-        used_windows = True
-        # continue backwards with time windows
-        rows = _dedup_rows(rows)
-        if rows:
-            oldest = min(int(r.get("timestamp") or 0) for r in rows)
-            end_ts = oldest - 1
-        else:
-            end_ts = int(time.time())
-        window_days = INIT_WINDOW_DAYS
-        empty_streak = 0
-        got_any = False
-        total_before_windows = len(rows)
+    empty_after_data = 0
+
+    if need_fallback:
+        used_fallback = True
+        oldest_edge = await fetch_edge_ts(session, limiter, logger, user, asc=True)
+        logger.warning(f"[fallback] user={user} initial_rows={len(rows)} oldest_ts={oldest_ts}, oldest_limit={oldest_edge}")
 
         while True:
-            start_ts = end_ts - int(window_days * 86400)
-            w_rows, near_cap = await fetch_window_pages(session, limiter, user, start_ts, end_ts)
-            if near_cap and window_days > MIN_WINDOW_DAYS:
-                # shrink and re-try same end
-                window_days = max(MIN_WINDOW_DAYS, max(1, window_days // 2))
-                logger.debug(f"[window] user={user} near-cap, shrink window_days={window_days}")
-                continue
-
-            if not w_rows:
-                empty_streak += 1
-                if got_any and empty_streak >= EMPTY_WINDOWS_TO_STOP:
-                    logger.debug(f"[window] user={user} two empty windows, stop.")
-                    break
-            else:
-                got_any = True
-                empty_streak = 0
-                rows.extend(w_rows)
-                rows = _dedup_rows(rows)
-
-            end_ts = start_ts - 1
-            # safety: stop if we went too far back
-            if end_ts < 1_500_000_000:  # ~2017
+            if current_end < 1_600_000_000:  # stop very old
                 break
 
-        logger.warning(f"[user] time-window fallback: user={user} total_rows={len(rows)} (initial={total_before_windows})")
+            if oldest_edge is not None and current_end < oldest_edge:
+                break
 
-    return _dedup_rows(rows), used_windows, name, pseudo
+            base_days = float(window_days)
+            tw = max(min_days, min(tw_curr, base_days))  # start this interval from current window
 
-# -------------------------
-# Raw write and ingest
-# -------------------------
-def user_raw_path(batch_dir: str, user: str) -> str:
-    safe = user.lower()
-    return os.path.join(batch_dir, f"{safe}.jsonl")
+            while True:
+                start_ts = max(0, int(current_end - tw * 86400))
+                wrows = await fetch_window_backward(session, limiter, logger, user, start_ts, current_end)
+                windows_used += 1
 
-def write_raw_jsonl(batch_dir: str, user: str, rows: List[Dict]) -> str:
-    os.makedirs(batch_dir, exist_ok=True)
-    fp = user_raw_path(batch_dir, user)
-    with open(fp, "w", encoding="utf-8") as f:
+                added = 0
+                w_min_ts = None
+                for r in wrows:
+                    uid = compute_trade_uid(r)
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    rows.append(r)
+                    added += 1
+                    ts = extract_ts(r)
+                    if ts is not None:
+                        w_min_ts = ts if w_min_ts is None else min(w_min_ts, ts)
+
+                logger.debug(f"[window] user={user} start={start_ts} end={current_end} got={len(wrows)} added={added} days={tw:g}")
+
+                # Near-cap → shrink and retry SAME interval
+                if len(wrows) >= cap and tw > min_days:
+                    tw = max(min_days, tw / 2.0)
+                    logger.debug(f"[window] near-cap→shrink days to {tw:g} and retry same interval")
+                    continue
+
+                # Success without near-cap → prepare to grow next interval
+                if wrows and len(wrows) < cap:
+                    tw_curr = min(base_days, max(min_days, tw * 1.05))
+                else:
+                    # keep current tw_curr (already small if we shrank), or after empty keep as-is
+                    tw_curr = max(min_days, min(tw_curr, base_days))
+
+                # advance time cursor
+                if wrows:
+                    empty_after_data = 0
+                    if w_min_ts:
+                        current_end = min(current_end, w_min_ts - 1)
+                    else:
+                        current_end = start_ts - 1
+                else:
+                    empty_after_data += 1
+                    current_end = start_ts - 1
+                    if empty_after_data >= 2:
+                        break
+                break  # next outer iteration
+
+
+    return rows, windows_used, used_fallback
+
+# ---------- Raw I/O ----------
+
+def raw_path_for_user(raw_trades_dir: Path, wallet: str) -> Path:
+    a, b = _shard_parts(wallet)
+    return raw_trades_dir / a / b / f"{wallet}.jsonl"
+
+
+def write_raw_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    return fp
+            f.write(safe_json_dumps(r) + "\n")
 
-def read_raw_jsonl(path: str) -> List[Dict]:
-    out: List[Dict] = []
-    with open(path, "r", encoding="utf-8") as f:
+def read_raw_jsonl(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
-            s = line.strip()
-            if not s:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                out.append(json.loads(s))
+                out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
     return out
 
-def ensure_market_exists(conn: sqlite3.Connection, r: Dict, user: str) -> None:
-    """If a trade references a market not in `markets`, insert a minimal placeholder and log a warning."""
-    cid = r.get("conditionId")
-    if not cid:
-        return
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM markets WHERE condition_id=?", (cid,))
-    if cur.fetchone():
-        return
+# ---------- Single-writer worker ----------
 
-    slug = r.get("slug")
-    desc = r.get("title") or r.get("name")
-    ts = r.get("timestamp")
-    start_iso = None
-    try:
-        start_iso = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        pass
+class IngestWorker:
+    def __init__(self, db_path: Path, logger: logging.Logger):
+        self.db_path = db_path
+        self.logger = logger
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._stop = asyncio.Event()
+        self._conn: Optional[sqlite3.Connection] = None
+        self.total_inserted = 0
+        self.total_files = 0
+        self.total_placeholders = 0
 
-    cur.execute(
-        """INSERT OR IGNORE INTO markets
-           (condition_id, slug, start_date, end_date, description, volume, closed, event_id, winner_asset_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (cid, slug, start_iso, None, desc, None, None, None, None),
-    )
-    logger.warning(f"[new-market] user={user} market={cid} encountered in trades; upserted placeholder row")
+    async def start(self):
+        # Open connection in main thread; we will only use it sequentially in this worker.
+        self._conn = db_connect(self.db_path)
+        ensure_tables(self._conn)
 
+    async def stop(self):
+        self._stop.set()
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
-# -------------------------
-# Orchestration
-# -------------------------
-async def fetch_all_users(users: List[str], batch_dir: str, concurrency: int, resume: bool) -> Dict[str, Tuple[int, bool, Optional[str], Optional[str]]]:
-    limiter = SlidingWindowLimiter(RATE_MAX, RATE_WIN)
-    sem = asyncio.Semaphore(concurrency)
-    results: Dict[str, Tuple[int, bool, Optional[str], Optional[str]]] = {}
+    async def put(self, wallet: str, filepath: Path, name: Optional[str], pseudonym: Optional[str]):
+        await self.queue.put((wallet, filepath, name, pseudonym))
 
-    connector = aiohttp.TCPConnector(limit=concurrency * 4)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        async def one(user: str):
-            fp = user_raw_path(batch_dir, user)
-            if resume and os.path.isfile(fp):
-                logger.info(f"[skip] resume is on and file exists: {fp}")
-                rows = read_raw_jsonl(fp)
-                results[user] = (len(rows), False, None, None)
-                return
-            async with sem:
-                t0 = time.time()
-                rows, used_windows, name, pseudo = await fetch_user_all(session, limiter, user)
-                write_raw_jsonl(batch_dir, user, rows)
-                dt = time.time() - t0
-                results[user] = (len(rows), used_windows, name, pseudo)
-                logger.info(f"[done] user={user} rows={len(rows)} used_windows={used_windows} t={dt:.1f}s")
+    async def run(self):
+        assert self._conn is not None
+        while not (self._stop.is_set() and self.queue.empty()):
+            try:
+                wallet, filepath, name, pseudonym = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                rows = await asyncio.to_thread(read_raw_jsonl, filepath)
+                # Insert trades
+                inserted, markets = await asyncio.to_thread(upsert_trades, self._conn, rows)
+                # Update user metadata
+                await asyncio.to_thread(update_user_metadata, self._conn, wallet, name, pseudonym)
+                # Ensure market placeholders
+                # Compute per-condition oldest ts + meta from rows
+                cond_meta: Dict[str, Tuple[Optional[str], Optional[str], Optional[int]]] = {}
+                for r in rows:
+                    cond, slug, desc = extract_market_meta_from_row(r)
+                    ts = extract_ts(r)
+                    if cond not in cond_meta:
+                        cond_meta[cond] = (slug, desc, ts)
+                    else:
+                        cur = cond_meta[cond]
+                        # track oldest ts
+                        ots = ts if ts is not None else cur[2]
+                        if cur[2] is not None and ts is not None:
+                            ots = min(cur[2], ts)
+                        cond_meta[cond] = (cur[0] or slug, cur[1] or desc, ots)
+                placeholders = await asyncio.to_thread(
+                    ensure_market_placeholders,
+                    self._conn,
+                    wallet,
+                    cond_meta,
+                    self.logger
+                )
+                self.total_inserted += inserted
+                self.total_files += 1
+                self.total_placeholders += placeholders
+                self.logger.debug(f"[ingest] user={wallet} file={filepath.name} inserted={inserted} placeholders={placeholders}")
+            except Exception as e:
+                self.logger.warning(f"[ingest] failed wallet={wallet} file={filepath} err={type(e).__name__}: {e}")
+            finally:
+                self.queue.task_done()
 
-        tasks = [asyncio.create_task(one(u)) for u in users]
-        for coro in asyncio.as_completed(tasks):
-            await coro
+# ---------- Orchestrator ----------
 
-    return results
+async def process_user(
+    user: str,
+    session: aiohttp.ClientSession,
+    limiter: SlidingWindowLimiter,
+    logger: logging.Logger,
+    raw_trades_dir: Path,
+    resume: bool,
+    ingest: IngestWorker,
+    sem: asyncio.Semaphore,
+    stats: Dict[str, Any],
+):
+    async with sem:
+        t0 = time.monotonic()
+        raw_path = raw_path_for_user(raw_trades_dir, user)
+        if resume and raw_path.exists():
+            # enqueue ingestion of existing file
+            rows = read_raw_jsonl(raw_path)
+            name, pseudo = extract_user_meta_from_rows(rows)
+            await ingest.put(user, raw_path, name, pseudo)
+            dt = time.monotonic() - t0
+            logger.info(f"[user] {user} resume file exists → enqueue ingest only rows={len(rows)} time={dt:.2f}s")
+            stats["skipped"] += 1
+            return
 
-def list_users(conn: sqlite3.Connection, only: Optional[List[str]], limit: int) -> List[str]:
-    cur = conn.cursor()
-    if only:
-        qmarks = ",".join("?" for _ in only)
-        cur.execute(f"SELECT id FROM users WHERE id IN ({qmarks})", only)
-        users = [r[0] for r in cur.fetchall()]
+        rows, windows_used, used_fallback = await fetch_user_all(session, limiter, logger, user)
+
+        if used_fallback:
+            logger.warning(f"[fallback-summary] user={user} total_rows={len(rows)} windows={windows_used}")
+
+        # Write raw file
+        write_raw_jsonl(raw_path, rows)
+        # Extract user meta
+        name, pseudo = extract_user_meta_from_rows(rows)
+        # Enqueue for ingestion
+        await ingest.put(user, raw_path, name, pseudo)
+
+        dt = time.monotonic() - t0
+        logger.info(f"[user] {user} rows={len(rows)} windows={windows_used} time={dt:.2f}s")
+        stats["fetched"] += 1
+        stats["rows"] += len(rows)
+        stats["windows"] += windows_used
+        if used_fallback:
+            stats["fallback_users"] += 1
+
+# ---------- Main ----------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Fetch Polymarket user trades → per-user JSONL → single-writer SQLite ingest.")
+    p.add_argument("--only", type=str, help="Comma-separated list of user wallets to limit to", default=None)
+    p.add_argument("--resume", action="store_true", help="Skip fetching for users whose raw JSONL exists in this batch; enqueue ingest.")
+    return p.parse_args()
+
+async def main_async():
+    # Base paths
+    base_dir = Path.home() / "Documents" / "Projects" / "polymarket-db"
+    ensure_dir(base_dir)
+
+    # Batch + logging
+    batch_tag = ts_to_batch(now_utc_ts())
+    log_level = env_str("PMDB_LOG_LEVEL", "INFO")
+    logger = setup_logger(base_dir, batch_tag, log_level)
+
+    # Env knobs
+    concurrency = max(1, env_int("PMDB_CONCURRENCY", 8))
+    rate_max = max(1, env_int("PMDB_RATE_MAX", 100))
+    rate_win = max(1, env_int("PMDB_RATE_WINDOW", 10))
+    raw_dir_name = env_str("PMDB_RAW_DIR", "raw_trades")
+    users_limit = max(0, env_int("PMDB_USERS_LIMIT", 0))
+
+    db_path = base_dir / "polymarket.db"
+    raw_trades_dir = base_dir / raw_dir_name
+    ensure_dir(raw_trades_dir)
+
+    args = parse_args()
+
+    # Determine users list
+    only_list: Optional[List[str]] = None
+    if args.only:
+        only_list = [w.strip() for w in args.only.split(",") if w.strip()]
+
+    # Prepare DB connection for reading users or creating if missing
+    rd_conn = db_connect(db_path)
+    ensure_tables(rd_conn)
+
+    if only_list:
+        users = only_list
     else:
-        cur.execute("SELECT id FROM users")
-        users = [r[0] for r in cur.fetchall()]
-    users = [u for u in users if u]  # clean
-    users.sort()
-    if limit and limit > 0:
-        users = users[:limit]
-    return users
+        users = get_all_user_ids(rd_conn)
+        if users_limit > 0:
+            users = users[:users_limit]
+    if not users:
+        print("No users to process. Provide --only or ensure users table is populated.", file=sys.stderr)
+        return
 
-def ingest_batch(conn: sqlite3.Connection, batch_dir: str, fetch_meta: Dict[str, Tuple[int, bool, Optional[str], Optional[str]]]) -> Tuple[int, int]:
-    files = [user_raw_path(batch_dir, u) for u in fetch_meta.keys() if os.path.isfile(user_raw_path(batch_dir, u))]
-    total_rows = 0
-    total_new = 0
-    with conn:
-        for fp in files:
-            rows = read_raw_jsonl(fp)
-            total_rows += len(rows)
-            # update user metadata based on this file
-            user = os.path.splitext(os.path.basename(fp))[0]
-            name = fetch_meta.get(user, (0, False, None, None))[2]
-            pseudo = fetch_meta.get(user, (0, False, None, None))[3]
-            update_user_metadata(conn, user, name, pseudo)
-            n = upsert_trades(conn, user, rows)
-            total_new += n
-    return total_rows, total_new
+    # Start ingest worker
+    ingest = IngestWorker(db_path, logger)
+    await ingest.start()
+    worker_task = asyncio.create_task(ingest.run())
+
+    limiter = SlidingWindowLimiter(rate_max, rate_win, logger)
+    sem = asyncio.Semaphore(concurrency)
+
+    # HTTP session
+    timeout = aiohttp.ClientTimeout(total=30)
+    conn = aiohttp.TCPConnector(limit=concurrency * 4, force_close=False, ttl_dns_cache=60)
+    async with aiohttp.ClientSession(timeout=timeout, connector=conn) as session:
+        logger.info(
+            f"[start] db={db_path} raw_dir={raw_trades_dir} concurrency={concurrency} rate={rate_max}/{rate_win}s users={len(users)} resume={args.resume}"
+        )
+        stats = {"fetched": 0, "skipped": 0, "rows": 0, "windows": 0, "fallback_users": 0}
+        tasks = [
+            process_user(u, session, limiter, logger, raw_trades_dir, args.resume, ingest, sem, stats)
+            for u in users
+        ]
+        await asyncio.gather(*tasks)
+
+        # drain queue
+        await ingest.queue.join()
+        await ingest.stop()
+        # stop worker
+        await asyncio.sleep(0.05)  # allow graceful stop condition
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+        logger.info(
+            f"[done] users_total={len(users)} fetched={stats['fetched']} skipped={stats['skipped']} "
+            f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']} "
+            f"ingested_files={ingest.total_files} inserted_rows={ingest.total_inserted} placeholders={ingest.total_placeholders}"
+        )
 
 def main():
-    os.makedirs(RAW_DIR, exist_ok=True)
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--only", help="Comma-separated list of user proxyWallets to fetch", default=None)
-    ap.add_argument("--resume", action="store_true", help="Skip users that already have a raw JSONL file in this batch dir")
-    args = ap.parse_args()
-
-    logger.info(f"Start. DB={DB_PATH} RAW_DIR={RAW_DIR} CONCURRENCY={CONCURRENCY} RATE={RATE_MAX}/{RATE_WIN}s LOG={LOG_PATH}")
-
-    conn = sqlite3.connect(DB_PATH)
-    ensure_schema(conn)
-
-    only_list = [s.strip().lower() for s in args.only.split(",")] if args.only else None
-    users = list_users(conn, only_list, USERS_LIMIT)
-    if not users:
-        logger.info("No users found.")
-        return
-
-    batch_dir = os.path.join(RAW_DIR, time.strftime("%Y%m%d-%H%M%S"))
-    logger.info(f"Users to fetch: {len(users)} | batch_dir={batch_dir}")
-
-    # Stage 1: fetch raw
-    t0 = time.time()
-    fetch_meta = asyncio.run(fetch_all_users(users, batch_dir, CONCURRENCY, resume=args.resume))
-    dt1 = time.time() - t0
-
-    # Warn users that hit time-window
-    for u, (cnt, used_windows, _, _) in fetch_meta.items():
-        if used_windows:
-            logger.warning(f"[warn] user={u} triggered time-window fallback; rows={cnt}")
-
-    # Stage 2: ingest
-    t1 = time.time()
-    total_rows, total_new = ingest_batch(conn, batch_dir, fetch_meta)
-    dt2 = time.time() - t1
-    conn.commit()
-    conn.close()
-
-    logger.info(f"Done. fetched_rows={total_rows} inserted_new={total_new} users={len(fetch_meta)} fetch_time={dt1:.1f}s ingest_time={dt2:.1f}s")
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
