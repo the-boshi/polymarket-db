@@ -19,7 +19,7 @@ from datetime import datetime, date, timedelta
 import calendar
 
 from utils import infer_winner, ensure_list, _market_start_date
-from fetch_users_utils import get_all_takers
+from fetch_users_utils_par import get_all_takers
 
 # -------------------------
 # Paths and constants
@@ -31,6 +31,8 @@ LOG_DIR     = os.path.join(BASE_DIR, "logs")
 LOG_PATH    = os.path.join(LOG_DIR, f"users-{time.strftime('%Y%m%d-%H%M%S')}.log")
 
 LOG_LEVEL = os.getenv("PMDB_LOG_LEVEL", "INFO").upper()
+
+NUM_WORKERS = 5
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -112,6 +114,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
     os.makedirs(BASE_DIR, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA_SQL)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     logger.info(f"Initialized DB at {db_path}")
     return conn
 
@@ -283,6 +288,48 @@ def process_market(cur: sqlite3.Cursor, market: Dict):
 
     logger.info(f"linked_users={len(takers)}")
 
+import concurrent.futures, sqlite3
+from itertools import islice
+
+import sqlite3, time, random
+
+def _process_market_parallel(m):
+    for attempt in range(10):
+        try:
+            conn = sqlite3.connect(
+                DB_PATH,
+                timeout=30,
+                check_same_thread=False,
+                isolation_level=None,  # autocommit; we control txn
+            )
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA busy_timeout=5000;")
+
+                cur = conn.cursor()
+                cur.execute("BEGIN;")
+                process_market(cur, m)
+                conn.commit()
+                return
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "database is locked" in msg or "busy" in msg:
+                #print("database locked")
+                time.sleep(min(0.05 * (2 ** attempt), 2.0) + random.random() * 0.05)
+                continue
+            raise
+
+def _batched(it, n):
+    it = iter(it)
+    while True:
+        chunk = list(islice(it, n))
+        if not chunk:
+            return
+        yield chunk
+
 # -------------------------
 # Main
 # -------------------------
@@ -313,13 +360,16 @@ def main():
     for fp in jsonl_files:
         users_before = count_users(cur)
         logger.info(f"Begin file transaction: {fp}")
-        with conn:
-            for m in iter_market_jsonl(fp):
-                try:
-                    process_market(cur, m)
-                    total_markets += 1
-                except Exception as e:
-                    logger.warning(f"Skip market due to error: {e}")
+        for batch in _batched(iter_market_jsonl(fp), 10):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+                futs = [ex.submit(_process_market_parallel, m) for m in batch]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        fut.result()
+                        total_markets += 1
+                    except Exception as e:
+                        logger.warning(f"Skip market due to error: {e}")
+
         users_after = count_users(cur)
         total_users = users_after
         logger.info(f"Committed file: {fp} | new_users={users_after - users_before} | total_users={total_users}")
