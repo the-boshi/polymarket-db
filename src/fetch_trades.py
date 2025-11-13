@@ -395,7 +395,7 @@ def ensure_market_placeholders(conn: sqlite3.Connection, wallet: str, cond_to_me
         )
         if cur.rowcount > 0:
             new_count += 1
-            logger.warning(f"[new-market] user={wallet} market={cond} upserted placeholder")
+            logger.debug(f"[new-market] user={wallet} market={cond} upserted placeholder")
     cur.close()
     return new_count
 
@@ -515,7 +515,7 @@ async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict
     if need_fallback:
         used_fallback = True
         oldest_edge = await fetch_edge_ts(session, limiter, logger, user, asc=True)
-        logger.warning(f"[fallback] user={user} initial_rows={len(rows)} oldest_ts={oldest_ts}, oldest_limit={oldest_edge}")
+        #logger.warning(f"[fallback] user={user} initial_rows={len(rows)} oldest_ts={oldest_ts}, oldest_limit={oldest_edge}")
 
         while True:
             if current_end < 1_600_000_000:  # stop very old
@@ -582,7 +582,6 @@ async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict
 def raw_path_for_user(raw_trades_dir: Path, wallet: str) -> Path:
     a, b = _shard_parts(wallet)
     return raw_trades_dir / a / b / f"{wallet}.jsonl"
-
 
 def write_raw_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     ensure_dir(path.parent)
@@ -679,6 +678,7 @@ class IngestWorker:
 
 # ---------- Orchestrator ----------
 
+# signature
 async def process_user(
     user: str,
     session: aiohttp.ClientSession,
@@ -689,7 +689,10 @@ async def process_user(
     ingest: IngestWorker,
     sem: asyncio.Semaphore,
     stats: Dict[str, Any],
+    stats_lock: asyncio.Lock,
+    log_every: int,
 ):
+
     async with sem:
         t0 = time.monotonic()
         raw_path = raw_path_for_user(raw_trades_dir, user)
@@ -699,14 +702,21 @@ async def process_user(
             name, pseudo = extract_user_meta_from_rows(rows)
             await ingest.put(user, raw_path, name, pseudo)
             dt = time.monotonic() - t0
-            logger.info(f"[user] {user} resume file exists → enqueue ingest only rows={len(rows)} time={dt:.2f}s")
-            stats["skipped"] += 1
+
+            async with stats_lock:
+                stats["skipped"] += 1
+                stats["processed"] += 1
+                if stats["processed"] % log_every == 0:
+                    logger.info(
+                        f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} "
+                        f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']}"
+                    )
             return
 
         rows, windows_used, used_fallback = await fetch_user_all(session, limiter, logger, user)
 
         if used_fallback:
-            logger.warning(f"[fallback-summary] user={user} total_rows={len(rows)} windows={windows_used}")
+            logger.debug(f"[fallback-summary] user={user} total_rows={len(rows)} windows={windows_used}")
 
         # Write raw file
         write_raw_jsonl(raw_path, rows)
@@ -716,12 +726,20 @@ async def process_user(
         await ingest.put(user, raw_path, name, pseudo)
 
         dt = time.monotonic() - t0
-        logger.info(f"[user] {user} rows={len(rows)} windows={windows_used} time={dt:.2f}s")
-        stats["fetched"] += 1
-        stats["rows"] += len(rows)
-        stats["windows"] += windows_used
-        if used_fallback:
-            stats["fallback_users"] += 1
+
+        async with stats_lock:
+            stats["fetched"] += 1
+            stats["rows"] += len(rows)
+            stats["windows"] += windows_used
+            if used_fallback:
+                stats["fallback_users"] += 1
+            stats["processed"] += 1
+            if stats["processed"] % log_every == 0:
+                logger.info(
+                    f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} "
+                    f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']}"
+                )
+
 
 # ---------- Main ----------
 
@@ -733,7 +751,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main_async():
     # Base paths
-    base_dir = Path.home() / "Documents" / "Projects" / "polymarket-db"
+    base_dir = Path.home() / "Projects" / "polymarket-db"
     ensure_dir(base_dir)
 
     # Batch + logging
@@ -742,8 +760,8 @@ async def main_async():
     logger = setup_logger(base_dir, batch_tag, log_level)
 
     # Env knobs
-    concurrency = max(1, env_int("PMDB_CONCURRENCY", 8))
-    rate_max = max(1, env_int("PMDB_RATE_MAX", 100))
+    concurrency = max(1, env_int("PMDB_CONCURRENCY", 15))
+    rate_max = max(1, env_int("PMDB_RATE_MAX", 150))
     rate_win = max(1, env_int("PMDB_RATE_WINDOW", 10))
     raw_dir_name = env_str("PMDB_RAW_DIR", "raw_trades")
     users_limit = max(0, env_int("PMDB_USERS_LIMIT", 0))
@@ -788,11 +806,16 @@ async def main_async():
         logger.info(
             f"[start] db={db_path} raw_dir={raw_trades_dir} concurrency={concurrency} rate={rate_max}/{rate_win}s users={len(users)} resume={args.resume}"
         )
-        stats = {"fetched": 0, "skipped": 0, "rows": 0, "windows": 0, "fallback_users": 0}
+
+        LOG_EVERY = max(1, env_int("PMDB_LOG_EVERY", 1000))
+        stats_lock = asyncio.Lock()
+        stats = {"fetched": 0, "skipped": 0, "rows": 0, "windows": 0, "fallback_users": 0, "processed": 0}
+
         tasks = [
-            process_user(u, session, limiter, logger, raw_trades_dir, args.resume, ingest, sem, stats)
+            process_user(u, session, limiter, logger, raw_trades_dir, args.resume, ingest, sem, stats, stats_lock, LOG_EVERY)
             for u in users
         ]
+
         await asyncio.gather(*tasks)
 
         # drain queue

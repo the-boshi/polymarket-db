@@ -15,7 +15,9 @@ __pycache__/
 data_old/
 old/
 raw_trades/
+markets/
 
 *.log
 *.db*
 *.sqlite
+

@@ -28,7 +28,7 @@ from fetch_users_utils import get_all_takers
 # -------------------------
 # Paths and constants
 # -------------------------
-BASE_DIR    = os.path.expanduser("~/Documents/Projects/polymarket-db")
+BASE_DIR    = os.path.expanduser("~/Projects/polymarket-db")
 MARKETS_DIR = os.path.join(BASE_DIR, "markets")
 DB_PATH     = os.path.join(BASE_DIR, "polymarket.db")
 LOG_DIR     = os.path.join(BASE_DIR, "logs")
@@ -181,12 +181,19 @@ def count_users(cur: sqlite3.Cursor) -> int:
     (n,) = cur.fetchone()
     return int(n)
 
+def load_known_markets(cur: sqlite3.Cursor) -> set[str]:
+    cur.execute("SELECT condition_id FROM markets WHERE volume IS NOT NULL")
+    rows = cur.fetchall()
+    known = {r[0] for r in rows if r[0]}
+    logger.info(f"Loaded {len(known)} existing markets from DB for skipping")
+    return known
+
 # -------------------------
 # JSONL iterator
 # -------------------------
 def iter_market_jsonl(files_glob: str) -> Iterable[Dict]:
     for path in sorted(glob.glob(files_glob)):
-        logger.info(f"Reading file: {path}")
+        #logger.info(f"Reading file: {path}")
         with open(path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f, 1):
                 s = line.strip()
@@ -311,6 +318,7 @@ def main():
     ap.add_argument("--month", help="YYYY-MM month to ingest, e.g. 2024-10")
     ap.add_argument("--from-date", dest="from_date", help="YYYY-MM-DD inclusive")
     ap.add_argument("--to-date",   dest="to_date",   help="YYYY-MM-DD inclusive")
+    ap.add_argument("--resume", action="store_true", help="Skip markets that were already upserted to db")
     args = ap.parse_args()
 
     logger.info(f"Start. BASE_DIR={BASE_DIR}, MARKETS_DIR={MARKETS_DIR}, LOG_LEVEL={LOG_LEVEL}, "
@@ -324,6 +332,8 @@ def main():
     conn = init_db(DB_PATH)
     cur  = conn.cursor()
 
+    known_markets = load_known_markets(cur)
+
     jsonl_files = list_jsonl_files_by_date(args.month, args.from_date, args.to_date)
     logger.info(f"Found {len(jsonl_files)} JSONL files")
 
@@ -332,8 +342,16 @@ def main():
 
     for fp in jsonl_files:
         users_before = count_users(cur)
-        logger.info(f"Begin file transaction: {fp}")
-        for batch in _batched(iter_market_jsonl(fp), 10):
+        #logger.info(f"Begin file transaction: {fp}")
+        for batch in _batched(
+            (
+                m
+                for m in iter_market_jsonl(fp)
+                if not (args.resume and m.get("conditionId") and m["conditionId"] in known_markets)
+            ),
+            10,
+        ):
+
             # Phase 1: parallel fetch → per-market JSONL paths
             paths = []
             with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
