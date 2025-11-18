@@ -24,6 +24,14 @@ from typing import Any, Dict, List, Tuple, Optional
 import aiohttp
 
 API_URL = "https://data-api.polymarket.com/activity"
+BASE_DIR = "D:/Projects/polymarket-db"
+
+# default DEBUG on Windows, else INFO (overridable via PMDB_LOG_LEVEL)
+IS_WINDOWS = (os.name == "nt") or (platform.system() == "Windows")
+LOG_LEVEL = os.getenv("PMDB_LOG_LEVEL", "DEBUG" if IS_WINDOWS else "INFO").upper()
+
+class HttpRetryExhausted(Exception):
+    pass
 
 # ---------- Utilities ----------
 
@@ -87,7 +95,6 @@ def _shard_parts(wallet: str) -> tuple[str, str]:
         w = w.ljust(4, "0")
     return w[:2], w[2:4]
 
-
 # ---------- Logger ----------
 
 def setup_logger(base_dir: Path, batch_tag: str, level_name: str) -> logging.Logger:
@@ -95,8 +102,11 @@ def setup_logger(base_dir: Path, batch_tag: str, level_name: str) -> logging.Log
     ensure_dir(logs_dir)
     log_path = logs_dir / f"trades-{batch_tag}.log"
 
+
+
     logger = logging.getLogger("pmdb")
-    logger.setLevel(getattr(logging, level_name.upper(), logging.INFO))
+    #logger.setLevel(getattr(logging, level_name.upper(), logging.INFO))
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
     ch = logging.StreamHandler(sys.stdout)
@@ -133,7 +143,7 @@ class SlidingWindowLimiter:
                 # need to wait
                 wait = self.window - (now - self._dq[0]) + random.uniform(0.01, 0.05)
                 wait = max(0.01, min(wait, self.window))
-                self.logger.debug(f"[rate] stall {wait:.3f}s; q={len(self._dq)}/{self.max_calls}")
+                #self.logger.debug(f"[rate] stall {wait:.3f}s; q={len(self._dq)}/{self.max_calls}")
             await asyncio.sleep(wait)
 
 # ---------- HTTP GET with retries ----------
@@ -173,6 +183,7 @@ async def api_get_json(
             async with session.get(API_URL, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 status = resp.status
                 text = await resp.text()
+
                 if 200 <= status < 300:
                     try:
                         data = json.loads(text)
@@ -203,7 +214,7 @@ async def api_get_json(
                     jitter = random.uniform(0.4, 0.9)
                     sleep_s = backoff * jitter
                     backoff = min(backoff * 2.0, 8.0)
-                    logger.debug(f"[http] retry {attempt}/{max_retries} status={status} sleep={sleep_s:.2f} params={params} body[:120]={text[:120]!r}")
+                    logger.debug(f"[http] retry {attempt}/{max_retries} status={status} sleep={sleep_s:.2f}")
                     await asyncio.sleep(sleep_s)
                     continue
                 else:
@@ -218,8 +229,8 @@ async def api_get_json(
             await asyncio.sleep(sleep_s)
             continue
 
-    logger.warning(f"[http] final failure after retries params={params}")
-    return None
+    #logger.warning(f"[http] {status} failure for params={params}")
+    raise HttpRetryExhausted(f"status={status} offset={params['offset']}")
 
 # ---------- Trade key + field extraction ----------
 
@@ -395,7 +406,7 @@ def ensure_market_placeholders(conn: sqlite3.Connection, wallet: str, cond_to_me
         )
         if cur.rowcount > 0:
             new_count += 1
-            logger.debug(f"[new-market] user={wallet} market={cond} upserted placeholder")
+            #logger.debug(f"[new-market] user={wallet} market={cond} upserted placeholder")
     cur.close()
     return new_count
 
@@ -451,40 +462,61 @@ async def fetch_page(session, limiter, logger, user: str, limit: int, offset: in
     data = await api_get_json(session, limiter, params, logger)
     if data is None:
         return []
-    logger.debug(f"[fetch] user={user} limit={limit} offset={offset} start={start} end={end} rows={len(data)}")
+    #logger.debug(f"[fetch] user={user} limit={limit} offset={offset} start={start} end={end} rows={len(data)}")
     return data
 
-async def fetch_offsets_pass(session, limiter, logger, user: str) -> List[Dict[str, Any]]:
+async def fetch_offsets_pass(session, limiter, logger, user: str, start_ts: int | None, end_ts: int | None) -> Tuple[List[Dict[str, Any]], int]:
     out: List[Dict[str, Any]] = []
-    tasks = []
-    # serialize offsets to keep rate limiter simple
+    num_requests = 0
     for off in (0, 500, 1000):
-        data = await fetch_page(session, limiter, logger, user, 500, off, None, None)
+        data = await fetch_page(session, limiter, logger, user, 500, off, start_ts, end_ts)
+        num_requests += 1
         if not data:
             continue
         out.extend(data)
-        # if a page < 500, likely no further data for higher offsets
+
         if len(data) < 500 and off < 1000:
             # still try next offset? The spec says offsets 0/500/1000 always. We stop early to reduce load.
             break
-    return out
+    return out, num_requests
 
-async def fetch_window_backward(session, limiter, logger, user: str, start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for off in (0, 500, 1000):
-        data = await fetch_page(session, limiter, logger, user, 500, off, start_ts, end_ts)
-        if not data:
-            continue
-        out.extend(data)
-    return out
+async def fetch_time_range_dc(
+    session, limiter, logger, user: str,
+    t0: int, t1: int, cap: int, seen: set
+) -> tuple[list[dict], int]:
+    """Fetch [t0, t1] by recursively halving when a window hits cap."""
+    if t1 < t0:
+        return [], 0
+
+    # try whole window first
+    rows, reqs = await fetch_offsets_pass(session, limiter, logger, user, t0, t1)
+    if len(rows) < cap:
+        # accept page; dedupe against global 'seen'
+        out = []
+        added = 0
+        for r in rows:
+            uid = compute_trade_uid(r)
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(r)
+            added += 1
+        #logger.debug(f"[dc] user={user} window={t0}->{t1} rows={len(rows)} new={added}")
+        return out, reqs
+
+    # hit cap → split in half
+    mid = t0 + (t1 - t0) // 2
+    left_rows, left_reqs = await fetch_time_range_dc(session, limiter, logger, user, t0, mid, cap, seen)
+    right_rows, right_reqs = await fetch_time_range_dc(session, limiter, logger, user, mid + 1, t1, cap, seen)
+    return left_rows + right_rows, reqs + left_reqs + right_reqs
 
 async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict[str, Any]], int, bool]:
     """
-    Returns (rows, windows_used, used_fallback)
+    Returns (rows, num_requests, used_fallback)
     """
-    rows: List[Dict[str, Any]] = await fetch_offsets_pass(session, limiter, logger, user)
+    rows: List[Dict[str, Any]] = []
+    rows, num_requests = await fetch_offsets_pass(session, limiter, logger, user, None, None)
     used_fallback = False
-    windows_used = 0
 
     # Deduplicate early by trade_uid to avoid growing memory with repeats.
     seen = set()
@@ -498,9 +530,9 @@ async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict
     rows = deduped
 
     full_pages = 3 if len(rows) >= 1500 else sum(1 for k in (0, 500, 1000))
-    need_fallback = (len(rows) >= 1400)  # heuristic near-cap
+    need_fallback = (len(rows) >= 1500)  # heuristic near-cap
     if not rows:
-        return rows, windows_used, used_fallback
+        return rows, num_requests, used_fallback
 
     oldest_ts = min(extract_ts(r) or now_utc_ts() for r in rows)
     current_end = (oldest_ts - 1) if oldest_ts else int(time.time())
@@ -515,67 +547,22 @@ async def fetch_user_all(session, limiter, logger, user: str) -> Tuple[List[Dict
     if need_fallback:
         used_fallback = True
         oldest_edge = await fetch_edge_ts(session, limiter, logger, user, asc=True)
-        #logger.warning(f"[fallback] user={user} initial_rows={len(rows)} oldest_ts={oldest_ts}, oldest_limit={oldest_edge}")
+        t0 = max(0, int(oldest_edge or 0))
+        t1 = int(time.time())
+        mid = t0 + (t1 - t0) // 2
 
-        while True:
-            if current_end < 1_600_000_000:  # stop very old
-                break
+        # fetch first half, then second half; each half will recursively split again if it hits cap
+        left_rows, left_reqs = await fetch_time_range_dc(session, limiter, logger, user, t0, mid, cap=1495, seen=seen)
+        right_rows, right_reqs = await fetch_time_range_dc(session, limiter, logger, user, mid + 1, t1, cap=1495, seen=seen)
 
-            if oldest_edge is not None and current_end < oldest_edge:
-                break
+        rows.extend(left_rows)
+        rows.extend(right_rows)
+        num_requests += left_reqs + right_reqs
 
-            base_days = float(window_days)
-            tw = max(min_days, min(tw_curr, base_days))  # start this interval from current window
-
-            while True:
-                start_ts = max(0, int(current_end - tw * 86400))
-                wrows = await fetch_window_backward(session, limiter, logger, user, start_ts, current_end)
-                windows_used += 1
-
-                added = 0
-                w_min_ts = None
-                for r in wrows:
-                    uid = compute_trade_uid(r)
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
-                    rows.append(r)
-                    added += 1
-                    ts = extract_ts(r)
-                    if ts is not None:
-                        w_min_ts = ts if w_min_ts is None else min(w_min_ts, ts)
-
-                logger.debug(f"[window] user={user} start={start_ts} end={current_end} got={len(wrows)} added={added} days={tw:g}")
-
-                # Near-cap → shrink and retry SAME interval
-                if len(wrows) >= cap and tw > min_days:
-                    tw = max(min_days, tw / 2.0)
-                    logger.debug(f"[window] near-cap→shrink days to {tw:g} and retry same interval")
-                    continue
-
-                # Success without near-cap → prepare to grow next interval
-                if wrows and len(wrows) < cap:
-                    tw_curr = min(base_days, max(min_days, tw * 1.05))
-                else:
-                    # keep current tw_curr (already small if we shrank), or after empty keep as-is
-                    tw_curr = max(min_days, min(tw_curr, base_days))
-
-                # advance time cursor
-                if wrows:
-                    empty_after_data = 0
-                    if w_min_ts:
-                        current_end = min(current_end, w_min_ts - 1)
-                    else:
-                        current_end = start_ts - 1
-                else:
-                    empty_after_data += 1
-                    current_end = start_ts - 1
-                    if empty_after_data >= 2:
-                        break
-                break  # next outer iteration
+        #logger.debug(f"[fallback-dc] user={user} total_rows={len(rows)} request={left_reqs+right_reqs}")
 
 
-    return rows, windows_used, used_fallback
+    return rows, num_requests, used_fallback
 
 # ---------- Raw I/O ----------
 
@@ -670,7 +657,7 @@ class IngestWorker:
                 self.total_inserted += inserted
                 self.total_files += 1
                 self.total_placeholders += placeholders
-                self.logger.debug(f"[ingest] user={wallet} file={filepath.name} inserted={inserted} placeholders={placeholders}")
+                #self.logger.debug(f"[ingest] user={wallet} file={filepath.name} inserted={inserted} placeholders={placeholders}")
             except Exception as e:
                 self.logger.warning(f"[ingest] failed wallet={wallet} file={filepath} err={type(e).__name__}: {e}")
             finally:
@@ -696,7 +683,7 @@ async def process_user(
     async with sem:
         t0 = time.monotonic()
         raw_path = raw_path_for_user(raw_trades_dir, user)
-        if resume and raw_path.exists():
+        if resume and raw_path.exists() and raw_path.stat().st_size:
             # enqueue ingestion of existing file
             rows = read_raw_jsonl(raw_path)
             name, pseudo = extract_user_meta_from_rows(rows)
@@ -708,15 +695,25 @@ async def process_user(
                 stats["processed"] += 1
                 if stats["processed"] % log_every == 0:
                     logger.info(
-                        f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} "
-                        f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']}"
+                        f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} failed={stats['failed']} "
+                        f"rows_total={stats['rows']} requests={stats['requests']} fallback_users={stats['fallback_users']}"
                     )
+                    stats['requests'] = stats['fallback_users'] = stats['rows'] = stats['failed'] = stats['skipped'] = stats['fetched'] = 0
             return
 
-        rows, windows_used, used_fallback = await fetch_user_all(session, limiter, logger, user)
+        try:
+            rows, num_requests, used_fallback = await fetch_user_all(session, limiter, logger, user)
+        except HttpRetryExhausted as e:
+            logger.error(f"[skip-user] retries exhausted for user={user}: {e}")
+            rows, num_requests, used_fallback = [], 0, False
+        except Exception as e:
+            logger.error(f"[skip-user] unexpected error for user={user}: {e}")
+            rows, num_requests, used_fallback = [], 0, False
+
 
         if used_fallback:
-            logger.debug(f"[fallback-summary] user={user} total_rows={len(rows)} windows={windows_used}")
+            #logger.debug(f"[fallback-summary] user={user} total_rows={len(rows)} requests={num_requests}")
+            pass
 
         # Write raw file
         write_raw_jsonl(raw_path, rows)
@@ -730,16 +727,16 @@ async def process_user(
         async with stats_lock:
             stats["fetched"] += 1
             stats["rows"] += len(rows)
-            stats["windows"] += windows_used
+            stats["requests"] += num_requests
             if used_fallback:
                 stats["fallback_users"] += 1
             stats["processed"] += 1
             if stats["processed"] % log_every == 0:
                 logger.info(
-                    f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} "
-                    f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']}"
+                    f"[progress] processed={stats['processed']} fetched={stats['fetched']} skipped={stats['skipped']} failed={stats['failed']} "
+                    f"rows={stats['rows']} requests={stats['requests']} fallback_users={stats['fallback_users']}"
                 )
-
+                stats['requests'] = stats['fallback_users'] = stats['rows'] = stats['failed'] = stats['skipped'] = stats['fetched'] = 0
 
 # ---------- Main ----------
 
@@ -751,7 +748,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main_async():
     # Base paths
-    base_dir = Path.home() / "Projects" / "polymarket-db"
+    base_dir = Path(BASE_DIR)
     ensure_dir(base_dir)
 
     # Batch + logging
@@ -766,7 +763,11 @@ async def main_async():
     raw_dir_name = env_str("PMDB_RAW_DIR", "raw_trades")
     users_limit = max(0, env_int("PMDB_USERS_LIMIT", 0))
 
-    db_path = base_dir / "polymarket.db"
+    concurrency = 15
+    rate_max = 150
+    rate_win = 10
+
+    db_path = "C:/Users/nimro/polymarket-db-C/polymarket.db"
     raw_trades_dir = base_dir / raw_dir_name
     ensure_dir(raw_trades_dir)
 
@@ -809,7 +810,7 @@ async def main_async():
 
         LOG_EVERY = max(1, env_int("PMDB_LOG_EVERY", 1000))
         stats_lock = asyncio.Lock()
-        stats = {"fetched": 0, "skipped": 0, "rows": 0, "windows": 0, "fallback_users": 0, "processed": 0}
+        stats = {"fetched": 0, "skipped": 0, "rows": 0, "requests": 0, "fallback_users": 0, "processed": 0, "failed": 0}
 
         tasks = [
             process_user(u, session, limiter, logger, raw_trades_dir, args.resume, ingest, sem, stats, stats_lock, LOG_EVERY)
@@ -830,9 +831,7 @@ async def main_async():
             pass
 
         logger.info(
-            f"[done] users_total={len(users)} fetched={stats['fetched']} skipped={stats['skipped']} "
-            f"rows_total={stats['rows']} windows_used={stats['windows']} fallback_users={stats['fallback_users']} "
-            f"ingested_files={ingest.total_files} inserted_rows={ingest.total_inserted} placeholders={ingest.total_placeholders}"
+            f"[done]"
         )
 
 def main():
