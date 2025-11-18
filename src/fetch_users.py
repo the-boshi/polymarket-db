@@ -215,11 +215,11 @@ def _parse_ymd(s: str) -> date:
 
 def list_jsonl_files_by_date(
     month: Optional[str] = None,
-    from_date: Optional[str] = None,
-    to_date: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> List[str]:
     """Assumes filenames are MARKETS_DIR/YYYY-MM-DD.jsonl"""
-    if not month and not from_date and not to_date:
+    if not month and not start and not end:
         return sorted(glob.glob(os.path.join(MARKETS_DIR, "*.jsonl")))
 
     if month:
@@ -228,15 +228,15 @@ def list_jsonl_files_by_date(
         start_d = date(y, m, 1)
         end_d   = date(y, m, last_day)
     else:
-        if not from_date and not to_date:
+        if not start and not end:
             return sorted(glob.glob(os.path.join(MARKETS_DIR, "*.jsonl")))
-        if from_date and not to_date:
-            start_d = end_d = _parse_ymd(from_date)
-        elif to_date and not from_date:
-            start_d = end_d = _parse_ymd(to_date)
+        if start and not end:
+            start_d = end_d = _parse_ymd(start)
+        elif end and not start:
+            start_d = end_d = _parse_ymd(end)
         else:
-            start_d = _parse_ymd(from_date)
-            end_d   = _parse_ymd(to_date)
+            start_d = _parse_ymd(start)
+            end_d   = _parse_ymd(end)
         if end_d < start_d:
             start_d, end_d = end_d, start_d
 
@@ -316,13 +316,13 @@ def _batched(it, n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", help="YYYY-MM month to ingest, e.g. 2024-10")
-    ap.add_argument("--from-date", dest="from_date", help="YYYY-MM-DD inclusive")
-    ap.add_argument("--to-date",   dest="to_date",   help="YYYY-MM-DD inclusive")
+    ap.add_argument("--start", dest="start", help="YYYY-MM-DD inclusive")
+    ap.add_argument("--end",   dest="end",   help="YYYY-MM-DD inclusive")
     ap.add_argument("--resume", action="store_true", help="Skip markets that were already upserted to db")
     args = ap.parse_args()
 
     logger.info(f"Start. BASE_DIR={BASE_DIR}, MARKETS_DIR={MARKETS_DIR}, LOG_LEVEL={LOG_LEVEL}, "
-                f"month={args.month}, from_date={args.from_date}, to_date={args.to_date}")
+                f"month={args.month}, start={args.start}, end={args.end}")
     
     if not os.path.isdir(MARKETS_DIR):
         logger.error(f"Missing markets dir: {MARKETS_DIR}")
@@ -334,7 +334,7 @@ def main():
 
     known_markets = load_known_markets(cur)
 
-    jsonl_files = list_jsonl_files_by_date(args.month, args.from_date, args.to_date)
+    jsonl_files = list_jsonl_files_by_date(args.month, args.start, args.end)
     logger.info(f"Found {len(jsonl_files)} JSONL files")
 
     total_markets = 0
