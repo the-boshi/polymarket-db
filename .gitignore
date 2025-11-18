@@ -16,6 +16,10 @@ data_old/
 old/
 raw_trades/
 markets/
+.venv/
+data/
+new_markets/
+.idea/
 
 *.log
 *.db*
