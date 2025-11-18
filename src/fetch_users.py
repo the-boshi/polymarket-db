@@ -28,9 +28,9 @@ from fetch_users_utils import get_all_takers
 # -------------------------
 # Paths and constants
 # -------------------------
-BASE_DIR    = os.path.expanduser("~/Projects/polymarket-db")
-MARKETS_DIR = os.path.join(BASE_DIR, "markets")
-DB_PATH     = os.path.join(BASE_DIR, "polymarket.db")
+BASE_DIR    = os.path.expanduser("D:\Projects\polymarket-db")
+MARKETS_DIR = os.path.join(BASE_DIR, "new_markets")
+DB_PATH     = "C:/Users/nimro/polymarket-db-C/polymarket.db"
 LOG_DIR     = os.path.join(BASE_DIR, "logs")
 LOG_PATH    = os.path.join(LOG_DIR, f"users-{time.strftime('%Y%m%d-%H%M%S')}.log")
 
